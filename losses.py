@@ -29,8 +29,8 @@ def compute_style_loss(t_cs_map, style_map):
     std_loss = F.mse_loss(enc_std, style_std)
     g_c = gram_matrix(t_cs_map)
     g_s = gram_matrix(style_map)
-    gram_loss = F.mse_loss(g_c, g_s)
-     #gram_loss
+    gram_loss = F.l1_loss(g_c, g_s) * 100
+    #print(mean_loss, std_loss, gram_loss)
     return mean_loss + std_loss + gram_loss
 
 
