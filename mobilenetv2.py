@@ -6,6 +6,7 @@ arXiv preprint arXiv:1801.04381.
 import from https://github.com/tonylins/pytorch-mobilenet-v2
 """
 
+import torch
 import torch.nn as nn
 import math
 
@@ -36,60 +37,113 @@ def conv_3x3_bn(inp, oup, stride):
     return nn.Sequential(
         nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
         nn.BatchNorm2d(oup),
-        nn.ReLU6(inplace=False)
+        nn.Hardswish(True)
     )
 
 
 def conv_1x1_bn(inp, oup):
+    print("conv_1x1_bn oup", oup)
     return nn.Sequential(
         nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
         nn.BatchNorm2d(oup),
-        nn.ReLU6(inplace=False)
+        nn.Dropout(0.2),
+        nn.Hardswish(True)
     )
 
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+                nn.Linear(channel, _make_divisible(channel // reduction, 8)),
+                nn.ReLU(inplace=True),
+                nn.Linear(_make_divisible(channel // reduction, 8), channel),
+                h_sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        # Squeeze (Each channel represented by one value)
+        y = self.avg_pool(x).view(b, c)
+        
+        # Excite (Runs aggregate value for each channel through, gives value bentween [0,1] for each channel)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class Reshape(nn.Module):
+    def __init__(self, num_channels):
+        super().__init__()
+        self.pos_enc = nn.Parameter(torch.randn(1, num_channels * 4, 1, 1))
+
+        self.num_channels = num_channels
+    
+    def forward(self, x):
+        x = x + self.pos_enc
+        x = x.view(x.shape[0], self.num_channels, x.shape[2] * 2, x.shape[3] * 2)
+        return x
 
 class DepthWiseConv(nn.Module):
-    def __init__(self, inp, oup, stride, expand_ratio, use_norm=False, padding=0):
+    def __init__(self, inp, oup, stride, expand_ratio, kernel_size=3, use_norm=False, padding=0, use_identity=True):
         super().__init__()
         hidden_dim = round(inp * expand_ratio)
-        self.identity = stride == 1 and inp == oup
+        self.identity = stride == 1 and inp == oup and use_identity
         
         self._layers = []
         
         if expand_ratio == 1:
             # dw
             self._layers.append(nn.ReflectionPad2d((1, 1, 1, 1)))
-            self._layers.append(nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 0, groups=hidden_dim, bias=False))
+            self._layers.append(nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, 0, groups=hidden_dim, bias=False))
             if use_norm:
-                self._layers.append(nn.InstanceNorm2d(hidden_dim))
+                self._layers.append(nn.BatchNorm2d(hidden_dim, affine=True, track_running_stats=True))
+            self._layers.append(nn.Hardswish(True))
 
-            self._layers.append(nn.ReLU6(inplace=True))
+            # Squeeze-and-Excitation
+            self._layers.append(SELayer(hidden_dim))
 
             # pw-linear
             self._layers.append(nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False))
             if use_norm:
-                self._layers.append(nn.InstanceNorm2d(oup))
+                self._layers.append(nn.BatchNorm2d(oup, affine=True, track_running_stats=True))
             
         else:
-        #pw
-
+            #pw
             self._layers.append(nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False))
             if use_norm:
-                self._layers.append(nn.InstanceNorm2d(hidden_dim))
-            self._layers.append(nn.ReLU6(inplace=True))
+                self._layers.append(nn.BatchNorm2d(hidden_dim, affine=True, track_running_stats=True))
+            self._layers.append(nn.Hardswish(True))
             
             # dw
+            #self._layers.append(nn.ReflectionPad2d((1, 1, 1, 1)))
+            # if stride == 2:
+            #     self._layers.append(nn.Conv2d(hidden_dim, hidden_dim, 2, stride, 0, groups=hidden_dim, bias=False))    
+            # else:
+            #     self._layers.append(nn.Conv2d(hidden_dim, hidden_dim*4, 2, stride*2, 0, groups=hidden_dim, bias=False))
+            #     self._layers.append(Reshape(hidden_dim))
+            
             self._layers.append(nn.ReflectionPad2d((1, 1, 1, 1)))
             self._layers.append(nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 0, groups=hidden_dim, bias=False))
             if use_norm:
-                self._layers.append(nn.InstanceNorm2d(hidden_dim))
+                self._layers.append(nn.BatchNorm2d(hidden_dim, affine=True, track_running_stats=True))
             
-            self._layers.append(nn.ReLU6(inplace=True))
+            self._layers.append(nn.Hardswish(True))
+            
+            # Squeeze-and-Excitation
+            self._layers.append(SELayer(hidden_dim))
+            
             
             # pw-linear
             self._layers.append(nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False))
             if use_norm:
-                self._layers.append(nn.InstanceNorm2d(oup))
+                self._layers.append(nn.BatchNorm2d(oup, affine=True, track_running_stats=True))
             
         self._layers = nn.ModuleList(self._layers)
         self._initialize_weights()
@@ -102,6 +156,7 @@ class DepthWiseConv(nn.Module):
         if self.identity:
             x = x + org_x
         # print("x.shape", x.shape, "\n")
+
         return x
 
 
@@ -133,7 +188,7 @@ class InvertedResidual(nn.Module):
                 # dw
                 nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
-                nn.ReLU6(inplace=True),
+                nn.Hardswish(True),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(oup),
@@ -143,11 +198,11 @@ class InvertedResidual(nn.Module):
                 # pw
                 nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(hidden_dim),
-                nn.ReLU6(inplace=True),
+                nn.Hardswish(True),
                 # dw
                 nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
-                nn.ReLU6(inplace=True),
+                nn.Hardswish(True),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(oup),
@@ -180,6 +235,7 @@ class MobileNetV2(nn.Module):
 
         # building first layer
         input_channel = _make_divisible(32 * width_mult, 4 if width_mult == 0.1 else 8)
+        print(input_channel)
         layers = [conv_3x3_bn(3, input_channel, 2)]
         # building inverted residual blocks
         block = InvertedResidual
@@ -227,6 +283,16 @@ class MobileNetV2(nn.Module):
         # import torch.nn.functional as F
         # print(F.softmax(x).argmax(dim=1))
         return layer_outputs
+    
+    def predict_class(self, x):
+        for i, layer in enumerate(self.features):
+            #print("x.shape", x.shape, i)
+            x = layer(x)
+        x = self.conv(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
 
     def _initialize_weights(self):
         for m in self.modules():
