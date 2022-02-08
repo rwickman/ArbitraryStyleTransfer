@@ -10,6 +10,7 @@ import numpy as np
 from data_loader import *
 from models import AutoEncoder, Encoder, PretrainedEncoder
 from conf import *
+import conf as conf
 from losses import compute_content_loss
 
 
@@ -22,7 +23,7 @@ class AutoencoderTrainer:
         
         self.model = AutoEncoder().to(device)
         self.pretrained_mobnet = PretrainedEncoder().to(device).eval()
-        self.ae_optim = optim.Adam(self.model.parameters(), lr=self.args.lr)#, betas=[0.5, 0.99])
+        self.ae_optim = optim.Adam(self.model.parameters(), lr=self.args.lr, betas=[0.9, 0.99], eps=1e-7)
         
         self.loss_fn = nn.HuberLoss()
 
@@ -37,8 +38,9 @@ class AutoencoderTrainer:
         
         if self.args.load:
             self.load()
-            self.ae_optim.param_groups[0]["betas"] = (0.8, 0.9)
+            self.ae_optim.param_groups[0]["betas"] = (0.9, 0.99)
             self.ae_optim.param_groups[0]["lr"] = self.args.lr
+            self.ae_optim.param_groups[0]["eps"] = 1e-7
             print("self.ae_optim", self.ae_optim)
 
     def save(self):
@@ -71,12 +73,14 @@ class AutoencoderTrainer:
 
     def validate(self):
         total_val_loss = 0
-        
+        print("VALIDATING")
         val_imgs = next(self.val_loader).to(device)
+        print("val_imgs.shape", val_imgs.shape)
         self.model.eval()
         recon_imgs = self.model(val_imgs)
+
         total_val_loss += (val_imgs - recon_imgs).abs().mean()
-        
+        print("DONE VALIUDATION")
         self.train_dict["val_loss"].append(total_val_loss.item() / val_imgs.shape[0])
         self.model.train()
 
@@ -85,7 +89,9 @@ class AutoencoderTrainer:
         fig, axs = plt.subplots(1, 2, figsize=(16,6))
         plt.ion()
         for cur_iter in range(self.args.train_iter):
-            if (cur_iter + 1) % 16  == 0:
+            if (cur_iter + 1) % 32 == 0:
+                print("recon_loss", recon_loss * self.args.recon_lam)
+                print("content_loss", content_loss * self.args.perp_lam)
                 self.save()
                 print(f"Number of images trained on { self.args.batch_size * cur_iter}")
                 axs[0].imshow(content_imgs[0].detach().cpu().permute((1,2,0)))
@@ -93,13 +99,17 @@ class AutoencoderTrainer:
                 plt.draw()
                 plt.pause(0.01)
                 plt.show()
-                
-                self.validate()
+                print("\nrecon_imgs[0].min()", recon_imgs[0].min(), recon_imgs[0].max(), "\n")
+                if (cur_iter + 1) % 64 == 0:
+                    self.validate()
 
 
             
+            #content_imgs = torch.tensor(np.array(Image.open("temp_dataset/content_test/000000027497.jpg").convert("RGB").resize((512, 384)))).cuda().permute(2, 0, 1).unsqueeze(0) / 255
+           
+            
             content_imgs = next(self.content_iter).to(device)
-            recon_imgs = self.model(content_imgs.clone())
+            recon_imgs = self.model(content_imgs)
             self.ae_optim.zero_grad()
             recon_loss = self.loss_fn(recon_imgs, content_imgs)
             
@@ -119,21 +129,22 @@ class AutoencoderTrainer:
                 content_weight = 1.0
 
                 if i == 0:
-                    content_loss = compute_content_loss(content_maps[i].detach(), recon_maps[i]) * content_weight
+                    content_loss = compute_content_loss(recon_maps[i], content_maps[i].detach()) * content_weight
                 else:
-                    content_loss = content_loss + compute_content_loss(content_maps[i].detach(), recon_maps[i]) * content_weight
-            
+                    content_loss = content_loss + compute_content_loss(recon_maps[i], content_maps[i].detach()) * content_weight
+                # print(f"CUR CONTENT LOSS {i}:", compute_content_loss(recon_maps[i], content_maps[i].detach()))
             #print(content_loss, recon_loss)
             self.train_dict["train_loss"].append(recon_loss.item() )
             self.train_dict["perp_loss"].append(content_loss.item())
-            print("recon_loss", recon_loss * self.args.recon_lam)
-            print("content_loss", content_loss * self.args.perp_lam)
+            
             loss = self.args.recon_lam * recon_loss + self.args.perp_lam * content_loss
+            #print("loss", loss)
             loss.backward()
-
-            # print(self.model.encoder.mob_net[0][0].weight.grad.max(), self.model.encoder.mob_net[0][0].weight.grad.min(), self.model.encoder.mob_net[0][0].weight.grad.mean(), self.model.encoder.mob_net[0][0].weight.grad.std())
-            # print(self.model.encoder.mob_net[3]._layers[3], self.model.encoder.mob_net[3]._layers[3].pos_enc.grad.max())
-
+            nn.utils.clip_grad.clip_grad_norm_(self.model.parameters(), 10.0)
+            if (cur_iter + 1) % 16 == 0:
+                print(self.model.encoder.mob_net[0][0].weight.grad.max(), self.model.encoder.mob_net[0][0].weight.grad.min(), self.model.encoder.mob_net[0][0].weight.grad.mean(), self.model.encoder.mob_net[0][0].weight.grad.std())
+                print(self.model.decoder._img_out.weight.grad.max(), self.model.decoder._img_out.weight.grad.min(), self.model.decoder._img_out.weight.grad.mean(), self.model.decoder._img_out.weight.grad.std())
+            
             self.ae_optim.step()
 
     def get_distr(self, num_samples=16):
@@ -170,11 +181,11 @@ class AutoencoderTrainer:
 
 
 def main(args):
-    content_dir = ["/media/data/code/stylegan/data/kaggle_imgs_smaller_2/", "/media/data/code/stylegan/data/portraits_smaller_4/", "/media/data/datasets/unlabeled2017/", "/media/data/datasets/landscape", "/media/data/datasets/flickr_dataest/flickr30k_images/flickr30k_images/"] 
-    style_dir = ["/media/data/code/stylegan/data/kaggle_imgs_smaller_2/", "/media/data/code/stylegan/data/portraits_smaller_4/", "/media/data/datasets/wikiart_smaller", "temp_dataset/style/", "/media/data/datasets/landscape"]
-    content_dir = content_dir + style_dir
-
-    content_dataset = FlatFolderDataset(content_dir, get_transform(True))
+    #content_dir = ["/media/data/code/stylegan/data/kaggle_imgs_smaller_2/", "/media/data/code/stylegan/data/portraits_smaller_4/", "/media/data/datasets/unlabeled2017/", "/media/data/datasets/landscape", "/media/data/datasets/flickr_dataest/flickr30k_images/flickr30k_images/"] 
+    #style_dir = ["/media/data/datasets/wikiart_smaller", "temp_dataset/style/", "/media/data/datasets/landscape"]
+    content_dir = conf.content_dir + conf.style_dir
+    img_transform = ImageTransform(args.batch_size, use_transform=False)
+    content_dataset = FlatFolderDatasetAE(content_dir, img_transform)
 
 
     content_iter = iter(data.DataLoader(
@@ -183,8 +194,9 @@ def main(args):
         sampler = InfiniteSamplerWrapper(content_dataset),
         num_workers=8))
 
-    val_dir = ["temp_dataset/content/", "temp_dataset/content_test/", "temp_dataset/style_test/"]
-    val_dataset = FlatFolderDataset(val_dir, get_transform(False))
+    val_dir = ["temp_dataset/content/", "temp_dataset/content_test/", "temp_dataset/style_test/", "/media/data/datasets/wikiart"]
+    img_transform = ImageTransform(args.batch_size)
+    val_dataset = FlatFolderDatasetAE(val_dir, img_transform)
     #val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_loader = iter(data.DataLoader(
         val_dataset,
@@ -235,7 +247,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_iter", type=int, default=2048,
+    parser.add_argument("--train_iter", type=int, default=8192,
             help="Number of train iteration (batches of examples).")
     parser.add_argument("--batch_size", type=int, default=16,
             help="Number of train iteration (batches of examples).")

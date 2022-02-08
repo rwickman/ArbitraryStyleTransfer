@@ -9,6 +9,8 @@ import from https://github.com/tonylins/pytorch-mobilenet-v2
 import torch
 import torch.nn as nn
 import math
+from conf import *
+
 
 __all__ = ['mobilenetv2']
 
@@ -35,8 +37,8 @@ def _make_divisible(v, divisor, min_value=None):
 
 def conv_3x3_bn(inp, oup, stride):
     return nn.Sequential(
-        nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
-        nn.BatchNorm2d(oup),
+        nn.Conv2d(inp, oup, 3, stride, 1, bias=False, padding_mode="reflect"),
+        #nn.BatchNorm2d(oup),
         nn.Hardswish(True)
     )
 
@@ -66,14 +68,14 @@ class SELayer(nn.Module):
                 nn.Linear(channel, _make_divisible(channel // reduction, 8)),
                 nn.ReLU(inplace=True),
                 nn.Linear(_make_divisible(channel // reduction, 8), channel),
-                h_sigmoid()
+                nn.Hardtanh(0.0, 1.0)
         )
 
     def forward(self, x):
         b, c, _, _ = x.size()
         # Squeeze (Each channel represented by one value)
         y = self.avg_pool(x).view(b, c)
-        
+
         # Excite (Runs aggregate value for each channel through, gives value bentween [0,1] for each channel)
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
@@ -91,7 +93,7 @@ class Reshape(nn.Module):
         return x
 
 class DepthWiseConv(nn.Module):
-    def __init__(self, inp, oup, stride, expand_ratio, kernel_size=3, use_norm=False, padding=0, use_identity=True):
+    def __init__(self, inp, oup, stride, expand_ratio, kernel_size=3, use_norm=False, padding=0, use_identity=True, use_relu=False):
         super().__init__()
         hidden_dim = round(inp * expand_ratio)
         self.identity = stride == 1 and inp == oup and use_identity
@@ -129,8 +131,8 @@ class DepthWiseConv(nn.Module):
             #     self._layers.append(nn.Conv2d(hidden_dim, hidden_dim*4, 2, stride*2, 0, groups=hidden_dim, bias=False))
             #     self._layers.append(Reshape(hidden_dim))
             
-            self._layers.append(nn.ReflectionPad2d((1, 1, 1, 1)))
-            self._layers.append(nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 0, groups=hidden_dim, bias=False))
+            # self._layers.append(nn.ReflectionPad2d((1, 1, 1, 1)))
+            self._layers.append(nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim, bias=False, padding_mode="reflect"))
             if use_norm:
                 self._layers.append(nn.BatchNorm2d(hidden_dim, affine=True, track_running_stats=True))
             
@@ -151,7 +153,10 @@ class DepthWiseConv(nn.Module):
     def forward(self, x):
         org_x = x
         #print("\n")
-        for layer in self._layers:            
+        for layer in self._layers:
+            # if isinstance(layer, nn.BatchNorm2d):
+            #     continue
+            # else:    
             x = layer(x)
         if self.identity:
             x = x + org_x
